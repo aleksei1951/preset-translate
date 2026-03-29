@@ -1,0 +1,14 @@
+node_modules/
+
+# runtime config & state
+.translaterc.json
+glossary.json
+*.log
+
+# preset JSON files (user content, not part of the tool)
+*.json
+!package.json
+!package-lock.json
+
+# old prototype
+translate_322.js

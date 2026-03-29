@@ -1,0 +1,22 @@
+{
+  "name": "preset-translate",
+  "version": "2.1.0",
+  "description": "SillyTavern Preset Translator — translate preset JSON files while preserving macro syntax",
+  "main": "preset-translate.js",
+  "bin": {
+    "preset-translate": "./preset-translate.js"
+  },
+  "scripts": {
+    "start": "node preset-translate.js",
+    "dry-run": "node preset-translate.js --dry-run"
+  },
+  "dependencies": {
+    "@vitalets/google-translate-api": "^9.2.1",
+    "bing-translate-api": "^4.2.0",
+    "boxen": "^5.1.2",
+    "chalk": "^4.1.2",
+    "https-proxy-agent": "^7.0.6",
+    "inquirer": "^8.2.6",
+    "log-update": "^4.0.0"
+  }
+}
