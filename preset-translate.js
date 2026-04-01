@@ -600,6 +600,111 @@ async function translateContentLinewise(content, translateFn, logger, concurrenc
   return { ok: true, content: lines.join('\n'), linesFixed };
 }
 
+// ── HTML-aware replaceString translation ─────────────────────
+
+async function translateScriptStrings(scriptBlock, translateFn, glossaryMap) {
+  // Extract content between <script...> and </script>
+  const openMatch = scriptBlock.match(/^(<script[^>]*>)/i);
+  const closeTag = '</script>';
+  if (!openMatch) return scriptBlock;
+  const openTag = openMatch[1];
+  const inner = scriptBlock.slice(openTag.length, scriptBlock.length - closeTag.length);
+  if (!hasZh(inner)) return scriptBlock;
+
+  // Find all quoted strings containing Chinese
+  const stringRe = /(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g;
+  const replacements = [];
+  let match;
+  while ((match = stringRe.exec(inner)) !== null) {
+    const full = match[0];
+    const quote = full[0];
+    const strContent = full.slice(1, -1);
+    if (!hasZh(strContent)) continue;
+    replacements.push({ start: match.index, end: match.index + full.length, quote, content: strContent });
+  }
+
+  if (replacements.length === 0) return scriptBlock;
+
+  // Translate in reverse order to preserve indices
+  let result = inner;
+  for (let i = replacements.length - 1; i >= 0; i--) {
+    const r = replacements[i];
+    try {
+      const translated = await translateSmart(r.content, translateFn);
+      if (translated !== r.content) {
+        result = result.substring(0, r.start) + r.quote + translated + r.quote + result.substring(r.end);
+      }
+    } catch (e) { /* keep original on error */ }
+  }
+
+  return openTag + result + closeTag;
+}
+
+async function translateHtmlReplaceString(content, translateFn, chunkSize, logger, glossaryMap, concurrency) {
+  let text = content;
+  let backtickWrapper = null;
+
+  // Strip triple-backtick wrapper
+  const btMatch = text.match(/^(\s*```(?:html|htm)?\s*\n)([\s\S]*?)(\n\s*```\s*)$/i);
+  if (btMatch) {
+    backtickWrapper = { prefix: btMatch[1], suffix: btMatch[3] };
+    text = btMatch[2];
+  }
+
+  // Segment into style/script/html zones
+  const segmentRe = /<(style|script)\b[^>]*>[\s\S]*?<\/\1>/gi;
+  const segments = [];
+  let lastIdx = 0;
+  let seg;
+  while ((seg = segmentRe.exec(text)) !== null) {
+    if (seg.index > lastIdx) segments.push({ type: 'html', content: text.slice(lastIdx, seg.index) });
+    const tagType = seg[1].toLowerCase();
+    segments.push({ type: tagType, content: seg[0] });
+    lastIdx = seg.index + seg[0].length;
+  }
+  if (lastIdx < text.length) segments.push({ type: 'html', content: text.slice(lastIdx) });
+
+  // Process each segment
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+
+    if (s.type === 'style') continue; // CSS — skip
+
+    if (s.type === 'script') {
+      segments[i].content = await translateScriptStrings(s.content, translateFn, glossaryMap);
+      continue;
+    }
+
+    // HTML zone — translate attributes first, then text content via translateContent
+    if (s.type === 'html' && hasZh(s.content)) {
+      let html = s.content;
+
+      // Translate Chinese in key attributes
+      const attrRe = /((?:placeholder|title|alt|aria-label|data-tip)\s*=\s*")((?:[^"\\]|\\.)*?)(")/gi;
+      const attrMatches = [];
+      let am;
+      while ((am = attrRe.exec(html)) !== null) {
+        if (hasZh(am[2])) attrMatches.push({ start: am.index + am[1].length, end: am.index + am[1].length + am[2].length, value: am[2] });
+      }
+      for (let j = attrMatches.length - 1; j >= 0; j--) {
+        const a = attrMatches[j];
+        try {
+          const translated = await translateSmart(a.value, translateFn);
+          if (translated !== a.value) html = html.substring(0, a.start) + translated + html.substring(a.end);
+        } catch (e) { /* keep original */ }
+      }
+
+      // Translate text content between tags via existing translateContent
+      const result = await translateContent(html, translateFn, chunkSize, logger, glossaryMap, concurrency);
+      if (result.ok) segments[i].content = result.content;
+    }
+  }
+
+  let translated = segments.map(s => s.content).join('');
+  if (backtickWrapper) translated = backtickWrapper.prefix + translated + backtickWrapper.suffix;
+  return translated;
+}
+
 // ── TUI ───────────────────────────────────────────────────────
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -1092,23 +1197,34 @@ function getRegexScriptArrays(data) {
   return arrays;
 }
 
+function buildRegexMarkerPool(data) {
+  const allScripts = getRegexScriptArrays(data).flat();
+  const pool = new Set();
+  for (const s of allScripts) {
+    if (!s.findRegex) continue;
+    const raw = String(s.findRegex).replace(/^\//, '').replace(/\/[gimsuy]*$/, '');
+    const found = raw.match(/[\u3400-\u9fff\uf900-\ufaff]{2,}/g);
+    if (found) found.forEach(m => pool.add(m));
+  }
+  return pool;
+}
+
+function mergeMarkerPool(baseGlossary, markerPool) {
+  if (markerPool.size === 0) return baseGlossary;
+  const merged = { ...baseGlossary };
+  for (const term of markerPool) {
+    if (!(term in merged)) merged[term] = term;
+  }
+  return merged;
+}
+
 async function translateRegexScripts(data, translateFn, fallbackFn, chunkSize, fallbackChunkSize, glossary, concurrency, outputPath, logger) {
   const scriptArrays = getRegexScriptArrays(data);
   const allScripts = scriptArrays.flat();
   if (allScripts.length === 0) return { translated: 0, skipped: 0, failed: 0 };
 
-  const markerPool = new Set();
-  for (const s of allScripts) {
-    if (!s.findRegex) continue;
-    const raw = String(s.findRegex).replace(/^\//, '').replace(/\/[gimsuy]*$/, '');
-    const found = raw.match(/[\u3400-\u9fff\uf900-\ufaff]{2,}/g);
-    if (found) found.forEach(m => markerPool.add(m));
-  }
-
-  const safeGlossary = { ...glossary };
-  for (const term of markerPool) {
-    if (!(term in safeGlossary)) safeGlossary[term] = term;
-  }
+  const markerPool = buildRegexMarkerPool(data);
+  const safeGlossary = mergeMarkerPool(glossary, markerPool);
 
   let translated = 0, skipped = 0, failed = 0;
 
@@ -1131,37 +1247,54 @@ async function translateRegexScripts(data, translateFn, fallbackFn, chunkSize, f
       }
     }
 
-    // replaceString — cascade with safe glossary; findRegex never touched
+    // replaceString — HTML-aware or cascade with safe glossary; findRegex never touched
     if (s.replaceString && hasZh(s.replaceString)) {
-      try {
-        const cascade = [
-          { fn: translateFn, cs: chunkSize, mode: 'chunk' },
-          { fn: translateFn, cs: chunkSize, mode: 'linewise' },
-        ];
-        if (fallbackFn) {
-          cascade.push({ fn: fallbackFn, cs: fallbackChunkSize, mode: 'chunk' });
-          cascade.push({ fn: fallbackFn, cs: fallbackChunkSize, mode: 'linewise' });
-        }
+      const looksLikeHtml = /^\s*```(?:html|htm)?\s*\n/i.test(s.replaceString) ||
+        (/<[a-z][\s\S]*>/i.test(s.replaceString) && /<\/(?:div|span|style|script|p|body|html|section|header|footer)\b/i.test(s.replaceString));
 
-        let result = null;
-        for (const attempt of cascade) {
-          const r = attempt.mode === 'chunk'
-            ? await translateContent(s.replaceString, attempt.fn, attempt.cs, () => {}, safeGlossary, concurrency)
-            : await translateContentLinewise(s.replaceString, attempt.fn, () => {}, concurrency);
-          if (r.ok) { result = r; break; }
-        }
-
-        if (result && result.ok && result.content !== s.replaceString) {
-          s.replaceString = result.content;
-          changed = true;
-          logger.log(`[regex:${i}] replaceString OK`);
-        } else if (!result || !result.ok) {
+      if (looksLikeHtml) {
+        try {
+          const translated = await translateHtmlReplaceString(s.replaceString, translateFn, chunkSize, () => {}, safeGlossary, concurrency);
+          if (translated !== s.replaceString) {
+            s.replaceString = translated;
+            changed = true;
+            logger.log(`[regex:${i}] replaceString OK (HTML mode)`);
+          }
+        } catch (e) {
           failed++;
-          logger.log(`[regex:${i}] replaceString FAIL`);
+          logger.log(`[regex:${i}] HTML mode ERROR: ${e.message}`);
         }
-      } catch (e) {
-        failed++;
-        logger.log(`[regex:${i}] replaceString ERROR: ${e.message}`);
+      } else {
+        try {
+          const cascade = [
+            { fn: translateFn, cs: chunkSize, mode: 'chunk' },
+            { fn: translateFn, cs: chunkSize, mode: 'linewise' },
+          ];
+          if (fallbackFn) {
+            cascade.push({ fn: fallbackFn, cs: fallbackChunkSize, mode: 'chunk' });
+            cascade.push({ fn: fallbackFn, cs: fallbackChunkSize, mode: 'linewise' });
+          }
+
+          let result = null;
+          for (const attempt of cascade) {
+            const r = attempt.mode === 'chunk'
+              ? await translateContent(s.replaceString, attempt.fn, attempt.cs, () => {}, safeGlossary, concurrency)
+              : await translateContentLinewise(s.replaceString, attempt.fn, () => {}, concurrency);
+            if (r.ok) { result = r; break; }
+          }
+
+          if (result && result.ok && result.content !== s.replaceString) {
+            s.replaceString = result.content;
+            changed = true;
+            logger.log(`[regex:${i}] replaceString OK`);
+          } else if (!result || !result.ok) {
+            failed++;
+            logger.log(`[regex:${i}] replaceString FAIL`);
+          }
+        } catch (e) {
+          failed++;
+          logger.log(`[regex:${i}] replaceString ERROR: ${e.message}`);
+        }
       }
     }
 
@@ -1277,7 +1410,7 @@ async function main() {
   });
 
   // ── Shared cascade helper ──
-  async function cascadeTranslate(content, idx, label, loggerRef) {
+  async function cascadeTranslate(content, idx, label, loggerRef, overrideGlossary) {
     const attempts = [
       { fn: translateFn, cs: chunkSize, mode: 'chunk', label: config.engine },
       { fn: translateFn, cs: chunkSize, mode: 'linewise', label: `${config.engine} linewise` },
@@ -1290,7 +1423,7 @@ async function main() {
       const logDetail = (detail) => { state.currentDetail = detail; loggerRef.log(`[${idx}] ${detail}`); };
       let result;
       if (attempt.mode === 'chunk') {
-        result = await translateContent(content, attempt.fn, attempt.cs, logDetail, glossary, concurrency);
+        result = await translateContent(content, attempt.fn, attempt.cs, logDetail, overrideGlossary || glossary, concurrency);
       } else {
         state.currentDetail = `fallback: ${attempt.label}...`;
         result = await translateContentLinewise(content, attempt.fn, logDetail, concurrency);
@@ -1306,6 +1439,10 @@ async function main() {
 
   if (isCharCard) {
     // ── Character card translation loop ──
+    const markerPool = buildRegexMarkerPool(data.data || data);
+    const cardGlossary = mergeMarkerPool(glossary, markerPool);
+    if (markerPool.size > 0) logger.log(`Regex marker pool: ${markerPool.size} terms protected`);
+
     const items = getCharCardItems(data);
     state.total = items.length;
 
@@ -1326,7 +1463,7 @@ async function main() {
       logger.log(`[${i}] ${item.label}: ${item.content.length} chars`);
 
       try {
-        const result = await cascadeTranslate(item.content, i, item.label, logger);
+        const result = await cascadeTranslate(item.content, i, item.label, logger, cardGlossary);
         if (result && result.ok) {
           writeCharCardItem(data, item, result.content);
           state.translated++;
