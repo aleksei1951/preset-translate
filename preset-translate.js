@@ -44,7 +44,7 @@ const ARG_LLM_KEY = getArgValue('--llm-key');
 const ARG_LLM_MODEL = getArgValue('--llm-model');
 
 const PROXY_ENV = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
-const PROXY_URL = PROXY_ENV || 'http://127.0.0.1:12334';
+const PROXY_URL = PROXY_ENV || '';
 const LANG_NAMES = { en: 'English', ru: 'Russian', ja: 'Japanese', ko: 'Korean', de: 'German', fr: 'French', es: 'Spanish', pt: 'Portuguese', it: 'Italian', ar: 'Arabic' };
 
 // Bing uses zh-Hans/zh-Hant, Google uses zh-CN/zh-TW — map between them
@@ -130,6 +130,11 @@ const TRANSLATIONS = {
     reviewQuestion: 'Review %d translated prompts?', reviewMarked: 'Marked #%d for retry', reviewRetrying: 'Retrying %d prompts...',
     regexPhase: '── Translating regex scripts ──────────────────────────────────────',
     regexScripts: 'Regex scripts',
+    fieldsLabel: 'fields',
+    ccPhase: '── Translating character card ─────────────────────────────────────',
+    ccField: 'Field', ccGreeting: 'Greeting', ccLorebook: 'Lorebook',
+    ccAltGreeting: 'alternate greeting', ccLorebookEntry: 'lorebook entry',
+    summaryFields: 'Fields', noFiles: 'No translatable JSON files found in current directory.',
   },
   ru: {
     step1: '📁 Выбор пресета', step2: '⚙️  Движок перевода',
@@ -169,6 +174,11 @@ const TRANSLATIONS = {
     reviewQuestion: 'Просмотреть %d переведённых промптов?', reviewMarked: 'Отмечен #%d для повтора', reviewRetrying: 'Повтор %d промптов...',
     regexPhase: '── Перевод regex-скриптов ─────────────────────────────────────────',
     regexScripts: 'Regex-скрипты',
+    fieldsLabel: 'полей',
+    ccPhase: '── Перевод карточки персонажа ─────────────────────────────────────',
+    ccField: 'Поле', ccGreeting: 'Приветствие', ccLorebook: 'Лорбук',
+    ccAltGreeting: 'альт. приветствие', ccLorebookEntry: 'запись лорбука',
+    summaryFields: 'Полей', noFiles: 'Переводимые JSON-файлы не найдены в текущей директории.',
   },
   zh: {
     step1: '📁 选择预设', step2: '⚙️  翻译引擎',
@@ -208,6 +218,11 @@ const TRANSLATIONS = {
     reviewQuestion: '查看 %d 个已翻译的提示词？', reviewMarked: '已标记 #%d 重试', reviewRetrying: '正在重试 %d 个提示词...',
     regexPhase: '── 正在翻译正则脚本 ────────────────────────────────────────────────',
     regexScripts: '正则脚本',
+    fieldsLabel: '个字段',
+    ccPhase: '── 正在翻译角色卡 ──────────────────────────────────────────────────',
+    ccField: '字段', ccGreeting: '问候语', ccLorebook: '世界书',
+    ccAltGreeting: '备选问候', ccLorebookEntry: '世界书条目',
+    summaryFields: '字段', noFiles: '当前目录中未找到可翻译的 JSON 文件。',
   },
 };
 
@@ -320,10 +335,10 @@ function createTranslator(engine, fromLang, toLang, llmConfig) {
           ],
           temperature: 0.3
         }),
-        signal: AbortSignal.timeout(120000),
+        signal: AbortSignal.timeout(60000),
       };
       if (undiciProxyDispatcher) fetchOpts.dispatcher = undiciProxyDispatcher;
-      const resp = await fetch(url.replace(/\/+$/, '') + '/v1/chat/completions', fetchOpts);
+      const resp = await fetch(url.replace(/\/+$/, '') + '/chat/completions', fetchOpts);
       if (!resp.ok) throw new Error(`LLM API ${resp.status}: ${await resp.text()}`);
       const data = await resp.json();
       if (!data.choices || !data.choices[0] || !data.choices[0].message) {
@@ -340,12 +355,21 @@ async function translateSmart(text, translateFn, depth = 0) {
   if (!text || !text.trim()) return text;
   if (!hasZh(text)) return text;
 
+  let lastErr;
   for (let i = 0; i < 3; i++) {
     try { return await translateFn(text); }
-    catch (e) { if (i < 2) { await delay(3000 * (i + 1)); continue; } }
+    catch (e) {
+      lastErr = e;
+      const tag = depth > 0 ? `smart:d${depth}` : 'smart';
+      state.currentDetail = `${tag} retry ${i+1}/3: ${e.message.substring(0, 60)}`;
+      if (i < 2) await delay(2000 * (i + 1));
+    }
   }
 
-  if (text.length < 100 || depth > 5) return text;
+  if (text.length < 100 || depth > 5) {
+    addRecentLog('⚠', `give up ${text.length}ch: ${(lastErr||{}).message||'?'}`.substring(0, 60));
+    return text;
+  }
 
   const mid = Math.floor(text.length / 2);
   let splitAt = text.lastIndexOf('\n', mid);
@@ -680,18 +704,36 @@ class FileLogger {
 
 // ── Setup wizard ─────────────────────────────────────────────
 
+function detectFileType(d) {
+  if (d && Array.isArray(d.prompts)) return 'preset';
+  if (d && d.data && (d.spec === 'chara_card_v3' || d.spec === 'chara_card_v2' || d.data.first_mes !== undefined)) return 'character_card';
+  return null;
+}
+
+function getCharCardItemCount(d) {
+  let count = 0;
+  const fields = ['description','personality','scenario','first_mes','mes_example','system_prompt','post_history_instructions','creator_notes'];
+  for (const f of fields) if (d.data[f] && d.data[f].trim()) count++;
+  count += (d.data.alternate_greetings || []).length;
+  if (d.data.character_book && Array.isArray(d.data.character_book.entries))
+    count += d.data.character_book.entries.length;
+  return count;
+}
+
 function scanPresets(dir) {
   const files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.endsWith('_lock.json') && f !== 'package.json' && f !== 'package-lock.json' && f !== 'scriptNames.json');
   return files.map(f => {
     const full = path.join(dir, f);
     const stat = fs.statSync(full);
-    let promptCount = '?';
+    let type = null, itemCount = '?';
     try {
       const d = JSON.parse(fs.readFileSync(full, 'utf8'));
-      if (Array.isArray(d.prompts)) promptCount = d.prompts.length;
+      type = detectFileType(d);
+      if (type === 'preset') itemCount = d.prompts.length;
+      else if (type === 'character_card') itemCount = getCharCardItemCount(d);
     } catch (e) {}
-    return { name: f, size: stat.size, prompts: promptCount, path: full };
-  }).filter(f => f.prompts !== '?'); // only show files with prompts array
+    return { name: f, size: stat.size, type, items: itemCount, path: full };
+  }).filter(f => f.type !== null);
 }
 
 async function interactiveSetup() {
@@ -707,7 +749,7 @@ async function interactiveSetup() {
   step(1, 6, t('step1'));
   const presets = scanPresets(dir);
   if (presets.length === 0) {
-    console.log(chalk.red('\n  ' + t('noPresets')));
+    console.log(chalk.red('\n  ' + t('noFiles')));
     process.exit(1);
   }
 
@@ -717,8 +759,10 @@ async function interactiveSetup() {
     prefix: '  ',
     choices: presets.map(p => {
       const sizeStr = (p.size / 1024).toFixed(0).padStart(4);
+      const typeLabel = p.type === 'character_card' ? chalk.magenta('Character Card') : chalk.blue('Preset');
+      const itemLabel = p.type === 'character_card' ? t('fieldsLabel') : t('promptsLabel');
       return {
-        name: `  ${chalk.white.bold(p.name)}  ${chalk.gray('│')}  ${chalk.yellow(sizeStr + ' KB')}  ${chalk.gray('│')}  ${chalk.cyan(p.prompts + ' ' + t('promptsLabel'))}`,
+        name: `  ${chalk.white.bold(p.name)}  ${chalk.gray('(')}${typeLabel}${chalk.gray(')')}  ${chalk.gray('│')}  ${chalk.yellow(sizeStr + ' KB')}  ${chalk.gray('│')}  ${chalk.cyan(p.items + ' ' + itemLabel)}`,
         value: p.name, short: p.name,
       };
     }),
@@ -889,6 +933,9 @@ async function interactiveSetup() {
   }
   console.log();
 
+  const selectedPreset = presets.find(p => p.name === file);
+  const fileType = selectedPreset ? selectedPreset.type : 'preset';
+
   const ext = path.extname(file);
   const base = path.basename(file, ext);
   const outputFile = `${base}_${targetLang}${ext}`;
@@ -896,17 +943,28 @@ async function interactiveSetup() {
   // ── Step 6: Confirm ──
   step(6, 6, t('step6'));
   const data = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
-  const needsTranslation = data.prompts.filter(p => (p.name && hasZh(p.name)) || (p.content && hasZh(p.content))).length;
+
+  let needsTranslation, totalItems;
+  if (fileType === 'character_card') {
+    const items = getCharCardItems(data);
+    totalItems = items.length;
+    needsTranslation = items.filter(it => hasZh(it.content)).length;
+  } else {
+    totalItems = data.prompts.length;
+    needsTranslation = data.prompts.filter(p => (p.name && hasZh(p.name)) || (p.content && hasZh(p.content))).length;
+  }
+
   const glossaryInfo = Object.keys(glossary).length > 0 ? `\n${chalk.cyan('📖')} ${t('summaryGlossary')}: ${chalk.white(Object.keys(glossary).length)} ${t('summaryTerms')}` : '';
   const fallbackInfo = fallbackEngine !== 'none' ? `  ${chalk.gray('→')}  ${chalk.white(fallbackEngine)}` : '';
   const engineIcon = engine === 'bing' ? chalk.blue('⬡') : engine === 'google' ? chalk.red('◉') : chalk.magenta('◆');
+  const itemsLabel = fileType === 'character_card' ? t('summaryFields') : t('summaryPrompts');
 
   const totalSize = (fs.statSync(path.join(dir, file)).size / 1024).toFixed(0);
   console.log(boxen(
     `  ${chalk.gray(t('summaryFile'))}      ${chalk.cyan.bold(file)} ${chalk.cyan('->')} ${chalk.green.bold(outputFile)} ${chalk.gray('(' + totalSize + ' KB)')}\n` +
     `  ${chalk.gray(t('summaryEngine'))}    ${engineIcon} ${chalk.white.bold(engine)}${fallbackInfo}\n` +
     `  ${chalk.gray(t('summaryLang'))}  ${chalk.white.bold(sourceLang)} ${chalk.cyan('->')} ${chalk.white.bold(targetLang)}\n` +
-    `  ${chalk.gray(t('summaryPrompts'))}   ${chalk.white.bold(data.prompts.length)} ${t('summaryTotal')}  ${chalk.gray('·')}  ${chalk.yellow.bold(needsTranslation)} ${t('summaryToTranslate')}${glossaryInfo}`,
+    `  ${chalk.gray(itemsLabel)}   ${chalk.white.bold(totalItems)} ${t('summaryTotal')}  ${chalk.gray('·')}  ${chalk.yellow.bold(needsTranslation)} ${t('summaryToTranslate')}${glossaryInfo}`,
     { padding: { top: 0, bottom: 0, left: 1, right: 2 }, borderColor: 'green', borderStyle: 'round', title: chalk.bold.green(t('summaryTitle')), titleAlignment: 'center' }
   ));
 
@@ -917,7 +975,7 @@ async function interactiveSetup() {
   console.log();
 
   return {
-    inputFile: file, outputFile, engine, fallbackEngine, llmConfig,
+    inputFile: file, outputFile, engine, fallbackEngine, llmConfig, fileType,
     fromLang: sourceLang, toLang: targetLang,
     dryRun: options.includes('dryRun') || FLAG_DRY_RUN,
     log: options.includes('log') || FLAG_LOG,
@@ -953,6 +1011,66 @@ function dryRun(data, config) {
     rows.join('\n') + '\n\n' +
     chalk.gray('  ─────────────────────────────────') + '\n' +
     `  ${chalk.green.bold(ok)} ${chalk.green(t('dryReady'))} ${chalk.gray('(' + pctOk + '%)')}  ${chalk.gray('│')}  ${chalk.yellow.bold(needName)} ${chalk.yellow(t('dryNames'))}  ${chalk.gray('│')}  ${chalk.yellow.bold(needContent)} ${chalk.yellow(t('dryContents'))}`,
+    { padding: { top: 0, bottom: 0, left: 1, right: 2 }, borderColor: 'yellow', borderStyle: 'round', title: chalk.bold.yellow(t('dryScanTitle')), titleAlignment: 'center' }
+  ));
+  console.log();
+}
+
+// ── Character card helpers ────────────────────────────────────
+
+const CC_TEXT_FIELDS = ['description','personality','scenario','first_mes','mes_example','system_prompt','post_history_instructions','creator_notes'];
+
+function getCharCardItems(root) {
+  const d = root.data || root;
+  const items = [];
+  for (const f of CC_TEXT_FIELDS) {
+    if (d[f] && d[f].trim()) items.push({ id: `field:${f}`, label: f, content: d[f], type: 'field' });
+  }
+  (d.alternate_greetings || []).forEach((g, i) => {
+    if (g && g.trim()) items.push({ id: `greeting:${i}`, label: `${t('ccAltGreeting')} #${i+1}`, content: g, type: 'greeting', index: i });
+  });
+  if (d.character_book && Array.isArray(d.character_book.entries)) {
+    d.character_book.entries.forEach((e, i) => {
+      if (e.content && e.content.trim()) items.push({ id: `lore:${i}`, label: `${t('ccLorebookEntry')} #${i+1} ${(e.comment||'').substring(0,20)}`, content: e.content, type: 'lore', index: i });
+    });
+  }
+  return items;
+}
+
+function writeCharCardItem(root, item, translatedContent) {
+  const d = root.data || root;
+  if (item.type === 'field') {
+    const f = item.id.replace('field:', '');
+    d[f] = translatedContent;
+    if (root[f] !== undefined) root[f] = translatedContent;
+  } else if (item.type === 'greeting') {
+    d.alternate_greetings[item.index] = translatedContent;
+  } else if (item.type === 'lore') {
+    d.character_book.entries[item.index].content = translatedContent;
+  }
+}
+
+function dryRunCharCard(data) {
+  console.log();
+  const items = getCharCardItems(data);
+  let needTranslation = 0, ok = 0;
+  const rows = [];
+  items.forEach((it, i) => {
+    const nc = hasZh(it.content);
+    if (nc) needTranslation++; else { ok++; return; }
+    const sizeStr = chalk.yellow((it.content.length / 1024).toFixed(1) + ' KB');
+    rows.push(`  ${chalk.gray('#' + String(i).padStart(3))}  ${sizeStr.padEnd(18)}  ${chalk.white(it.label.substring(0, 50))}`);
+  });
+  const total = items.length;
+  const pctOk = total > 0 ? Math.round(ok / total * 100) : 0;
+  const regexCount = getRegexScriptArrays(data).flat().length;
+  const regexLine = regexCount > 0 ? `  ${chalk.gray('│')}  ${chalk.cyan.bold(regexCount)} ${chalk.cyan(t('regexScripts'))}` : '';
+  console.log(boxen(
+    chalk.bold.yellow(t('dryTitle')) + '\n' +
+    chalk.gray('  ─────────────────────────────────') + '\n\n' +
+    rows.join('\n') + '\n\n' +
+    chalk.gray('  ─────────────────────────────────') + '\n' +
+    `  ${chalk.green.bold(ok)} ${chalk.green(t('dryReady'))} ${chalk.gray('(' + pctOk + '%)')}  ${chalk.gray('│')}  ${chalk.yellow.bold(needTranslation)} ${chalk.yellow(t('dryContents'))}${regexLine}`,
     { padding: { top: 0, bottom: 0, left: 1, right: 2 }, borderColor: 'yellow', borderStyle: 'round', title: chalk.bold.yellow(t('dryScanTitle')), titleAlignment: 'center' }
   ));
   console.log();
@@ -1070,16 +1188,28 @@ async function main() {
   const outputPath = path.join(dir, config.outputFile);
   const logger = new FileLogger(config.log);
 
+  const isCharCard = config.fileType === 'character_card';
+
   let data;
   let resumeCount = 0;
   if (fs.existsSync(outputPath)) {
     try {
       const existing = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
-      const translatedNames = existing.prompts.filter(p => p.name && !hasZh(p.name)).length;
-      if (translatedNames > 10) {
-        data = existing;
-        resumeCount = translatedNames;
-        logger.log(`Resuming from ${config.outputFile} (${resumeCount} already done)`);
+      if (isCharCard) {
+        const origItems = getCharCardItems(JSON.parse(fs.readFileSync(inputPath, 'utf8')));
+        const existItems = getCharCardItems(existing);
+        let done = 0;
+        for (let i = 0; i < origItems.length && i < existItems.length; i++) {
+          if (origItems[i].content !== existItems[i].content) done++;
+        }
+        if (done > 0) { data = existing; resumeCount = done; logger.log(`Resuming from ${config.outputFile} (${resumeCount} already done)`); }
+      } else {
+        const translatedNames = existing.prompts.filter(p => p.name && !hasZh(p.name)).length;
+        if (translatedNames > 10) {
+          data = existing;
+          resumeCount = translatedNames;
+          logger.log(`Resuming from ${config.outputFile} (${resumeCount} already done)`);
+        }
       }
     } catch (e) {}
   }
@@ -1089,19 +1219,22 @@ async function main() {
 
   // Dry run?
   if (config.dryRun) {
-    dryRun(data, config);
+    if (isCharCard) dryRunCharCard(data);
+    else dryRun(data, config);
     logger.close();
     return;
   }
 
-  // Collect known variable names
+  // Collect known variable names (presets only)
   const knownVarNames = new Set();
-  data.prompts.forEach(p => {
-    if (!p.content) return;
-    const re = /\{\{(?:set(?:global)?var|get(?:global)?var|addvar|incvar|decvar)::([^:}]+)/g;
-    let m;
-    while ((m = re.exec(p.content)) !== null) knownVarNames.add(m[1]);
-  });
+  if (!isCharCard) {
+    data.prompts.forEach(p => {
+      if (!p.content) return;
+      const re = /\{\{(?:set(?:global)?var|get(?:global)?var|addvar|incvar|decvar)::([^:}]+)/g;
+      let m;
+      while ((m = re.exec(p.content)) !== null) knownVarNames.add(m[1]);
+    });
+  }
 
   const translateFn = createTranslator(config.engine, config.fromLang, config.toLang, config.llmConfig);
   const fallbackFn = config.fallbackEngine !== 'none'
@@ -1117,7 +1250,7 @@ async function main() {
   state.toLang = config.toLang;
   state.inputFile = config.inputFile;
   state.outputFile = config.outputFile;
-  state.total = data.prompts.length;
+  state.total = isCharCard ? getCharCardItems(data).length : data.prompts.length;
   state.resumed = resumeCount;
   state.startTime = Date.now();
   state.running = true;
@@ -1143,102 +1276,143 @@ async function main() {
     process.exit(0);
   });
 
-  for (let i = 0; i < data.prompts.length; i++) {
-    const p = data.prompts[i];
-    state.current = i + 1;
-    let changed = false;
-
-    const nameNeedsTranslation = p.name && hasZh(p.name);
-    const contentNeedsTranslation = p.content && hasZh(p.content);
-
-    if (!nameNeedsTranslation && !contentNeedsTranslation) {
-      state.skipped++;
-      addRecentLog('⊘', `#${i} ${(p.name || '(marker)').substring(0, 40)} — skipped`);
-      logger.log(`[${i}] SKIP: ${p.name}`);
-      continue;
+  // ── Shared cascade helper ──
+  async function cascadeTranslate(content, idx, label, loggerRef) {
+    const attempts = [
+      { fn: translateFn, cs: chunkSize, mode: 'chunk', label: config.engine },
+      { fn: translateFn, cs: chunkSize, mode: 'linewise', label: `${config.engine} linewise` },
+    ];
+    if (fallbackFn) {
+      attempts.push({ fn: fallbackFn, cs: fallbackChunkSize, mode: 'chunk', label: config.fallbackEngine });
+      attempts.push({ fn: fallbackFn, cs: fallbackChunkSize, mode: 'linewise', label: `${config.fallbackEngine} linewise` });
     }
-
-    const promptStart = Date.now();
-    state.currentName = (p.name || '(marker)').substring(0, 40);
-    state.currentDetail = '';
-
-    if (nameNeedsTranslation) {
-      state.currentDetail = 'translating name...';
-      try {
-        const translated = await translateSmart(p.name, translateFn);
-        p.name = translated;
-        changed = true;
-        state.currentName = p.name.substring(0, 40);
-        logger.log(`[${i}] Name: ${p.name}`);
-        await delay(800);
-      } catch (e) {
-        logger.log(`[${i}] Name FAILED: ${e.message}`);
+    for (const attempt of attempts) {
+      const logDetail = (detail) => { state.currentDetail = detail; loggerRef.log(`[${idx}] ${detail}`); };
+      let result;
+      if (attempt.mode === 'chunk') {
+        result = await translateContent(content, attempt.fn, attempt.cs, logDetail, glossary, concurrency);
+      } else {
+        state.currentDetail = `fallback: ${attempt.label}...`;
+        result = await translateContentLinewise(content, attempt.fn, logDetail, concurrency);
       }
+      if (result.ok) {
+        if (attempt !== attempts[0]) addRecentLog('⚠', `#${idx} ${label} — via ${attempt.label}`);
+        return result;
+      }
+      loggerRef.log(`[${idx}] ${attempt.label} failed (${result.reason}), trying next...`);
     }
+    return null;
+  }
 
-    if (contentNeedsTranslation) {
-      state.currentDetail = `translating content (${(p.content.length / 1024).toFixed(1)} KB)...`;
-      logger.log(`[${i}] Content: ${p.content.length} chars`);
+  if (isCharCard) {
+    // ── Character card translation loop ──
+    const items = getCharCardItems(data);
+    state.total = items.length;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      state.current = i + 1;
+
+      if (!hasZh(item.content)) {
+        state.skipped++;
+        addRecentLog('⊘', `#${i} ${item.label.substring(0, 40)} — skipped`);
+        logger.log(`[${i}] SKIP: ${item.label}`);
+        continue;
+      }
+
+      const itemStart = Date.now();
+      state.currentName = item.label.substring(0, 40);
+      state.currentDetail = `translating (${(item.content.length / 1024).toFixed(1)} KB)...`;
+      logger.log(`[${i}] ${item.label}: ${item.content.length} chars`);
 
       try {
-        let contentResult = null;
-
-        // Cascade: primary chunk → primary linewise → fallback chunk → fallback linewise
-        const attempts = [
-          { fn: translateFn, cs: chunkSize, mode: 'chunk', label: config.engine },
-          { fn: translateFn, cs: chunkSize, mode: 'linewise', label: `${config.engine} linewise` },
-        ];
-        if (fallbackFn) {
-          attempts.push({ fn: fallbackFn, cs: fallbackChunkSize, mode: 'chunk', label: config.fallbackEngine });
-          attempts.push({ fn: fallbackFn, cs: fallbackChunkSize, mode: 'linewise', label: `${config.fallbackEngine} linewise` });
-        }
-
-        for (const attempt of attempts) {
-          const logDetail = (detail) => { state.currentDetail = detail; logger.log(`[${i}] ${detail}`); };
-          let result;
-          if (attempt.mode === 'chunk') {
-            result = await translateContent(p.content, attempt.fn, attempt.cs, logDetail, glossary, concurrency);
-          } else {
-            state.currentDetail = `fallback: ${attempt.label}...`;
-            result = await translateContentLinewise(p.content, attempt.fn, logDetail, concurrency);
-          }
-          if (result.ok) {
-            contentResult = result;
-            if (attempt !== attempts[0]) {
-              addRecentLog('⚠', `#${i} ${state.currentName} — via ${attempt.label}`);
-            }
-            break;
-          }
-          logger.log(`[${i}] ${attempt.label} failed (${result.reason}), trying next...`);
-        }
-
-        if (contentResult && contentResult.ok) {
-          p.content = contentResult.content;
-          changed = true;
+        const result = await cascadeTranslate(item.content, i, item.label, logger);
+        if (result && result.ok) {
+          writeCharCardItem(data, item, result.content);
           state.translated++;
-          addRecentLog('✓', `#${i} ${state.currentName}`);
+          addRecentLog('✓', `#${i} ${item.label}`);
           logger.log(`[${i}] OK`);
+          fs.writeFileSync(outputPath, JSON.stringify(data, null, 4));
         } else {
           state.failed++;
-          addRecentLog('⚠', `#${i} ${state.currentName} — all engines failed`);
+          addRecentLog('⚠', `#${i} ${item.label} — all engines failed`);
           logger.log(`[${i}] FAIL: all cascade attempts exhausted`);
         }
       } catch (e) {
         state.failed++;
-        addRecentLog('⚠', `#${i} ${state.currentName} — ERROR: ${e.message}`);
+        addRecentLog('⚠', `#${i} ${item.label} — ERROR: ${e.message}`);
         logger.log(`[${i}] ERROR: ${e.message}`);
       }
-    } else if (changed) {
-      // name was translated but content was ok
-      state.translated++;
-      addRecentLog('✓', `#${i} ${state.currentName} (name only)`);
+
+      state.promptTimes.push(Date.now() - itemStart);
     }
+  } else {
+    // ── Preset translation loop ──
+    for (let i = 0; i < data.prompts.length; i++) {
+      const p = data.prompts[i];
+      state.current = i + 1;
+      let changed = false;
 
-    state.promptTimes.push(Date.now() - promptStart);
+      const nameNeedsTranslation = p.name && hasZh(p.name);
+      const contentNeedsTranslation = p.content && hasZh(p.content);
 
-    // Incremental save
-    if (changed) {
-      fs.writeFileSync(outputPath, JSON.stringify(data, null, 4));
+      if (!nameNeedsTranslation && !contentNeedsTranslation) {
+        state.skipped++;
+        addRecentLog('⊘', `#${i} ${(p.name || '(marker)').substring(0, 40)} — skipped`);
+        logger.log(`[${i}] SKIP: ${p.name}`);
+        continue;
+      }
+
+      const promptStart = Date.now();
+      state.currentName = (p.name || '(marker)').substring(0, 40);
+      state.currentDetail = '';
+
+      if (nameNeedsTranslation) {
+        state.currentDetail = 'translating name...';
+        try {
+          const translated = await translateSmart(p.name, translateFn);
+          p.name = translated;
+          changed = true;
+          state.currentName = p.name.substring(0, 40);
+          logger.log(`[${i}] Name: ${p.name}`);
+          await delay(800);
+        } catch (e) {
+          logger.log(`[${i}] Name FAILED: ${e.message}`);
+        }
+      }
+
+      if (contentNeedsTranslation) {
+        state.currentDetail = `translating content (${(p.content.length / 1024).toFixed(1)} KB)...`;
+        logger.log(`[${i}] Content: ${p.content.length} chars`);
+
+        try {
+          const contentResult = await cascadeTranslate(p.content, i, state.currentName, logger);
+          if (contentResult && contentResult.ok) {
+            p.content = contentResult.content;
+            changed = true;
+            state.translated++;
+            addRecentLog('✓', `#${i} ${state.currentName}`);
+            logger.log(`[${i}] OK`);
+          } else {
+            state.failed++;
+            addRecentLog('⚠', `#${i} ${state.currentName} — all engines failed`);
+            logger.log(`[${i}] FAIL: all cascade attempts exhausted`);
+          }
+        } catch (e) {
+          state.failed++;
+          addRecentLog('⚠', `#${i} ${state.currentName} — ERROR: ${e.message}`);
+          logger.log(`[${i}] ERROR: ${e.message}`);
+        }
+      } else if (changed) {
+        state.translated++;
+        addRecentLog('✓', `#${i} ${state.currentName} (name only)`);
+      }
+
+      state.promptTimes.push(Date.now() - promptStart);
+
+      if (changed) {
+        fs.writeFileSync(outputPath, JSON.stringify(data, null, 4));
+      }
     }
   }
 
@@ -1299,84 +1473,159 @@ async function main() {
 
   // ── Review mode ───────────────────────────────────────────
   const originalData = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
-  const changedIndices = [];
-  for (let i = 0; i < data.prompts.length; i++) {
-    if (data.prompts[i].content !== originalData.prompts[i].content ||
-        data.prompts[i].name !== originalData.prompts[i].name) {
-      changedIndices.push(i);
+
+  if (isCharCard) {
+    const origItems = getCharCardItems(originalData);
+    const transItems = getCharCardItems(data);
+    const changedItems = [];
+    for (let i = 0; i < origItems.length && i < transItems.length; i++) {
+      if (origItems[i].content !== transItems[i].content) changedItems.push(i);
     }
-  }
 
-  if (changedIndices.length > 0) {
-    const { doReview } = await inquirer.prompt([{
-      type: 'confirm', name: 'doReview',
-      message: t('reviewQuestion').replace('%d', changedIndices.length),
-      default: false
-    }]);
+    if (changedItems.length > 0) {
+      const { doReview } = await inquirer.prompt([{
+        type: 'confirm', name: 'doReview',
+        message: t('reviewQuestion').replace('%d', changedItems.length),
+        default: false
+      }]);
 
-    if (doReview) {
-      const retryQueue = [];
-      let reviewIdx = 0;
+      if (doReview) {
+        const retryQueue = [];
+        let reviewIdx = 0;
+        while (reviewIdx < changedItems.length) {
+          const ci = changedItems[reviewIdx];
+          const origLines = origItems[ci].content.split('\n').slice(0, 15);
+          const transLines = transItems[ci].content.split('\n').slice(0, 15);
 
-      while (reviewIdx < changedIndices.length) {
-        const pi = changedIndices[reviewIdx];
-        const orig = originalData.prompts[pi];
-        const trans = data.prompts[pi];
+          console.log();
+          console.log(boxen(
+            chalk.bold(`${transItems[ci].label}`) + '\n\n' +
+            chalk.gray(t('reviewOrig')) + '\n' +
+            origLines.map(l => chalk.gray('  ' + l.substring(0, 80))).join('\n') + '\n\n' +
+            chalk.cyan(t('reviewTrans')) + '\n' +
+            transLines.map(l => chalk.cyan('  ' + l.substring(0, 80))).join('\n') +
+            (transLines.length >= 15 ? chalk.gray('\n  ...') : ''),
+            { padding: 1, borderColor: 'cyan', borderStyle: 'round', title: `${reviewIdx + 1}/${changedItems.length}` }
+          ));
 
-        const origLines = (orig.content || '').split('\n').slice(0, 15);
-        const transLines = (trans.content || '').split('\n').slice(0, 15);
-
-        console.log();
-        console.log(boxen(
-          chalk.bold(`#${pi} ${trans.name || '(marker)'}`) + '\n\n' +
-          chalk.gray(t('reviewOrig')) + '\n' +
-          origLines.map(l => chalk.gray('  ' + l.substring(0, 80))).join('\n') + '\n\n' +
-          chalk.cyan(t('reviewTrans')) + '\n' +
-          transLines.map(l => chalk.cyan('  ' + l.substring(0, 80))).join('\n') +
-          (transLines.length >= 15 ? chalk.gray('\n  ...') : ''),
-          { padding: 1, borderColor: 'cyan', borderStyle: 'round', title: `${reviewIdx + 1}/${changedIndices.length}` }
-        ));
-
-        const { action } = await inquirer.prompt([{
-          type: 'list', name: 'action', message: t('glossAction'),
-          choices: [
-            { name: t('reviewNext'), value: 'next' },
-            { name: t('reviewRetry'), value: 'retry' },
-            { name: t('reviewQuit'), value: 'quit' },
-          ],
-        }]);
-
-        if (action === 'retry') {
-          retryQueue.push(pi);
-          console.log(chalk.yellow('  ' + t('reviewMarked').replace('%d', pi)));
-        }
-        if (action === 'quit') break;
-        reviewIdx++;
-      }
-
-      if (retryQueue.length > 0) {
-        console.log(chalk.bold(`\n  ${t('reviewRetrying').replace('%d', retryQueue.length)}`));
-        const retryTranslateFn = createTranslator(config.engine, config.fromLang, config.toLang, config.llmConfig);
-
-        for (const pi of retryQueue) {
-          const p = data.prompts[pi];
-          const origP = originalData.prompts[pi];
-          console.log(`  #${pi} "${(p.name || '').substring(0, 40)}"...`);
-
-          try {
-            const result = await translateContent(origP.content, retryTranslateFn, chunkSize, () => {}, glossary, concurrency);
-            if (result.ok) {
-              p.content = result.content;
-              console.log(chalk.green(`    OK`));
-            } else {
-              console.log(chalk.red(`    Failed: ${result.reason}`));
-            }
-          } catch (e) {
-            console.log(chalk.red(`    Error: ${e.message}`));
+          const { action } = await inquirer.prompt([{
+            type: 'list', name: 'action', message: t('glossAction'),
+            choices: [
+              { name: t('reviewNext'), value: 'next' },
+              { name: t('reviewRetry'), value: 'retry' },
+              { name: t('reviewQuit'), value: 'quit' },
+            ],
+          }]);
+          if (action === 'retry') {
+            retryQueue.push(ci);
+            console.log(chalk.yellow('  ' + t('reviewMarked').replace('%d', ci)));
           }
+          if (action === 'quit') break;
+          reviewIdx++;
         }
-        fs.writeFileSync(outputPath, JSON.stringify(data, null, 4));
-        console.log(chalk.green(`  ${t('reviewDone')}`));
+
+        if (retryQueue.length > 0) {
+          console.log(chalk.bold(`\n  ${t('reviewRetrying').replace('%d', retryQueue.length)}`));
+          const retryTranslateFn = createTranslator(config.engine, config.fromLang, config.toLang, config.llmConfig);
+          for (const ci of retryQueue) {
+            console.log(`  ${origItems[ci].label}...`);
+            try {
+              const result = await translateContent(origItems[ci].content, retryTranslateFn, chunkSize, () => {}, glossary, concurrency);
+              if (result.ok) {
+                writeCharCardItem(data, origItems[ci], result.content);
+                console.log(chalk.green(`    OK`));
+              } else {
+                console.log(chalk.red(`    Failed: ${result.reason}`));
+              }
+            } catch (e) {
+              console.log(chalk.red(`    Error: ${e.message}`));
+            }
+          }
+          fs.writeFileSync(outputPath, JSON.stringify(data, null, 4));
+          console.log(chalk.green(`  ${t('reviewDone')}`));
+        }
+      }
+    }
+  } else {
+    const changedIndices = [];
+    for (let i = 0; i < data.prompts.length; i++) {
+      if (data.prompts[i].content !== originalData.prompts[i].content ||
+          data.prompts[i].name !== originalData.prompts[i].name) {
+        changedIndices.push(i);
+      }
+    }
+
+    if (changedIndices.length > 0) {
+      const { doReview } = await inquirer.prompt([{
+        type: 'confirm', name: 'doReview',
+        message: t('reviewQuestion').replace('%d', changedIndices.length),
+        default: false
+      }]);
+
+      if (doReview) {
+        const retryQueue = [];
+        let reviewIdx = 0;
+
+        while (reviewIdx < changedIndices.length) {
+          const pi = changedIndices[reviewIdx];
+          const orig = originalData.prompts[pi];
+          const trans = data.prompts[pi];
+
+          const origLines = (orig.content || '').split('\n').slice(0, 15);
+          const transLines = (trans.content || '').split('\n').slice(0, 15);
+
+          console.log();
+          console.log(boxen(
+            chalk.bold(`#${pi} ${trans.name || '(marker)'}`) + '\n\n' +
+            chalk.gray(t('reviewOrig')) + '\n' +
+            origLines.map(l => chalk.gray('  ' + l.substring(0, 80))).join('\n') + '\n\n' +
+            chalk.cyan(t('reviewTrans')) + '\n' +
+            transLines.map(l => chalk.cyan('  ' + l.substring(0, 80))).join('\n') +
+            (transLines.length >= 15 ? chalk.gray('\n  ...') : ''),
+            { padding: 1, borderColor: 'cyan', borderStyle: 'round', title: `${reviewIdx + 1}/${changedIndices.length}` }
+          ));
+
+          const { action } = await inquirer.prompt([{
+            type: 'list', name: 'action', message: t('glossAction'),
+            choices: [
+              { name: t('reviewNext'), value: 'next' },
+              { name: t('reviewRetry'), value: 'retry' },
+              { name: t('reviewQuit'), value: 'quit' },
+            ],
+          }]);
+
+          if (action === 'retry') {
+            retryQueue.push(pi);
+            console.log(chalk.yellow('  ' + t('reviewMarked').replace('%d', pi)));
+          }
+          if (action === 'quit') break;
+          reviewIdx++;
+        }
+
+        if (retryQueue.length > 0) {
+          console.log(chalk.bold(`\n  ${t('reviewRetrying').replace('%d', retryQueue.length)}`));
+          const retryTranslateFn = createTranslator(config.engine, config.fromLang, config.toLang, config.llmConfig);
+
+          for (const pi of retryQueue) {
+            const p = data.prompts[pi];
+            const origP = originalData.prompts[pi];
+            console.log(`  #${pi} "${(p.name || '').substring(0, 40)}"...`);
+
+            try {
+              const result = await translateContent(origP.content, retryTranslateFn, chunkSize, () => {}, glossary, concurrency);
+              if (result.ok) {
+                p.content = result.content;
+                console.log(chalk.green(`    OK`));
+              } else {
+                console.log(chalk.red(`    Failed: ${result.reason}`));
+              }
+            } catch (e) {
+              console.log(chalk.red(`    Error: ${e.message}`));
+            }
+          }
+          fs.writeFileSync(outputPath, JSON.stringify(data, null, 4));
+          console.log(chalk.green(`  ${t('reviewDone')}`));
+        }
       }
     }
   }

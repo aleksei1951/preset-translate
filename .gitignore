@@ -10,5 +10,5 @@ glossary.json
 !package.json
 !package-lock.json
 
-# old prototype
-translate_322.js
+# dev artifacts (tests, prototypes, notes)
+dev/
