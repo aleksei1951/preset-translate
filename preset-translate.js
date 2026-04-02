@@ -335,7 +335,7 @@ function createTranslator(engine, fromLang, toLang, llmConfig) {
           ],
           temperature: 0.3
         }),
-        signal: AbortSignal.timeout(60000),
+        signal: AbortSignal.timeout(120000),
       };
       if (undiciProxyDispatcher) fetchOpts.dispatcher = undiciProxyDispatcher;
       const resp = await fetch(url.replace(/\/+$/, '') + '/chat/completions', fetchOpts);
@@ -450,6 +450,20 @@ async function translateContent(content, translateFn, chunkSize, logger, glossar
   pt = protect(/<[^>]+>/g, pt);
   pt = protect(/^#{1,6}\s/gm, pt);
   pt = protect(/https?:\/\/[^\s]+/g, pt);
+  // Translate Chinese inside backtick blocks before protecting them
+  const btBlockRe = /(```\w*\r?\n)([\s\S]*?)(\r?\n\s*```)/g;
+  let btM;
+  const btReps = [];
+  while ((btM = btBlockRe.exec(pt)) !== null) {
+    if (hasZh(btM[2])) btReps.push({ start: btM.index, end: btM.index + btM[0].length, pre: btM[1], inner: btM[2], suf: btM[3] });
+  }
+  for (let bi = btReps.length - 1; bi >= 0; bi--) {
+    const b = btReps[bi];
+    try {
+      const tr = await translateSmart(b.inner, translateFn);
+      pt = pt.substring(0, b.start) + b.pre + tr + b.suf + pt.substring(b.end);
+    } catch (e) { /* keep original on error */ }
+  }
   pt = protect(/```[\s\S]*?```/g, pt);
   pt = protect(/`[^`]+`/g, pt);
   pt = protect(/\$\$[\s\S]*?\$\$/g, pt);
@@ -551,8 +565,25 @@ async function translateContent(content, translateFn, chunkSize, logger, glossar
 }
 
 // ── Linewise fallback ─────────────────────────────────────────
-async function translateContentLinewise(content, translateFn, logger, concurrency) {
-  const lines = content.split('\n');
+async function translateContentLinewise(content, translateFn, logger, concurrency, glossaryMap) {
+  // Apply glossary protection before line-by-line translation
+  const glossaryPh = {};
+  let gCnt = 0;
+  let glossaryContent = content;
+  if (glossaryMap && Object.keys(glossaryMap).length > 0) {
+    const sorted = Object.keys(glossaryMap).sort((a, b) => b.length - a.length);
+    for (const term of sorted) {
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(escaped, 'g');
+      glossaryContent = glossaryContent.replace(re, () => {
+        const id = '9176' + String(gCnt++).padStart(4, '0');
+        glossaryPh[id] = glossaryMap[term];
+        return id;
+      });
+    }
+  }
+
+  const lines = glossaryContent.split('\n');
   let linesFixed = 0;
 
   for (let j = 0; j < lines.length; j++) {
@@ -597,7 +628,17 @@ async function translateContentLinewise(content, translateFn, logger, concurrenc
   }
 
   if (linesFixed === 0) return { ok: false, reason: 'linewise: no lines translated', content };
-  return { ok: true, content: lines.join('\n'), linesFixed };
+
+  // Restore glossary placeholders
+  let finalContent = lines.join('\n');
+  const gSortedIds = Object.keys(glossaryPh).sort((a, b) => b.length - a.length);
+  for (const id of gSortedIds) finalContent = finalContent.split(id).join(glossaryPh[id]);
+  for (const id of gSortedIds) {
+    const fuzzyRe = new RegExp(id.split('').map(ch => ch + '\\s*').join(''), 'g');
+    finalContent = finalContent.replace(fuzzyRe, m => m.replace(/\s/g, '') === id ? glossaryPh[id] : m);
+  }
+
+  return { ok: true, content: finalContent, linesFixed };
 }
 
 // ── HTML-aware replaceString translation ─────────────────────
@@ -1254,7 +1295,7 @@ async function translateRegexScripts(data, translateFn, fallbackFn, chunkSize, f
 
       if (looksLikeHtml) {
         try {
-          const translated = await translateHtmlReplaceString(s.replaceString, translateFn, chunkSize, () => {}, safeGlossary, concurrency);
+          const translated = await translateHtmlReplaceString(s.replaceString, translateFn, chunkSize, (msg) => logger.log(`[regex:${i}] HTML: ${msg}`), safeGlossary, concurrency);
           if (translated !== s.replaceString) {
             s.replaceString = translated;
             changed = true;
@@ -1279,7 +1320,7 @@ async function translateRegexScripts(data, translateFn, fallbackFn, chunkSize, f
           for (const attempt of cascade) {
             const r = attempt.mode === 'chunk'
               ? await translateContent(s.replaceString, attempt.fn, attempt.cs, () => {}, safeGlossary, concurrency)
-              : await translateContentLinewise(s.replaceString, attempt.fn, () => {}, concurrency);
+              : await translateContentLinewise(s.replaceString, attempt.fn, () => {}, concurrency, safeGlossary);
             if (r.ok) { result = r; break; }
           }
 
@@ -1426,7 +1467,7 @@ async function main() {
         result = await translateContent(content, attempt.fn, attempt.cs, logDetail, overrideGlossary || glossary, concurrency);
       } else {
         state.currentDetail = `fallback: ${attempt.label}...`;
-        result = await translateContentLinewise(content, attempt.fn, logDetail, concurrency);
+        result = await translateContentLinewise(content, attempt.fn, logDetail, concurrency, overrideGlossary || glossary);
       }
       if (result.ok) {
         if (attempt !== attempts[0]) addRecentLog('⚠', `#${idx} ${label} — via ${attempt.label}`);
