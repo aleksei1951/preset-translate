@@ -286,21 +286,47 @@ if (PROXY_ENV) {
 // ── Translator ───────────────────────────────────────────────
 
 function createTranslator(engine, fromLang, toLang, llmConfig) {
+  // Wrap non-LLM translators to protect macros ({{user}}, {{char}}, etc.)
+  function withMacroProtect(rawTranslateFn) {
+    return async (text) => {
+      const ph = {};
+      let cnt = 0;
+      const protected_ = text.replace(/\{\{[^}]*\}\}/g, m => {
+        const id = '\u200B' + cnt + '\u200B';  // zero-width space wrapper — invisible to translator
+        ph[id] = m;
+        cnt++;
+        return id;
+      });
+      let result = await rawTranslateFn(protected_);
+      // Restore: exact match first, then fuzzy (translator may add spaces)
+      for (const [id, orig] of Object.entries(ph)) {
+        result = result.split(id).join(orig);
+      }
+      // Fuzzy restore — translator may strip zero-width spaces, leaving bare digits
+      for (const [id, orig] of Object.entries(ph)) {
+        const num = id.replace(/\u200B/g, '');
+        const fuzzy = new RegExp('\\u200B?\\s*' + num + '\\s*\\u200B?', 'g');
+        result = result.replace(fuzzy, orig);
+      }
+      return result;
+    };
+  }
+
   if (engine === 'bing') {
     const { translate } = require('bing-translate-api');
-    return async (text) => {
+    return withMacroProtect(async (text) => {
       const res = await translate(text, fromLang, toLang, false, false, undefined, proxyAgents);
       return res.translation;
-    };
+    });
   }
 
   if (engine === 'google') {
     const { translate } = require('@vitalets/google-translate-api');
     const fetchOptions = proxyAgents ? { agent: proxyAgents.https } : {};
-    return async (text) => {
+    return withMacroProtect(async (text) => {
       const res = await translate(text, { from: toGoogleLang(fromLang), to: toGoogleLang(toLang), fetchOptions });
       return res.text;
-    };
+    });
   }
 
   if (engine === 'llm') {
@@ -335,7 +361,7 @@ function createTranslator(engine, fromLang, toLang, llmConfig) {
           ],
           temperature: 0.3
         }),
-        signal: AbortSignal.timeout(120000),
+        signal: AbortSignal.timeout(180000),
       };
       if (undiciProxyDispatcher) fetchOpts.dispatcher = undiciProxyDispatcher;
       const resp = await fetch(url.replace(/\/+$/, '') + '/chat/completions', fetchOpts);
@@ -354,6 +380,18 @@ function createTranslator(engine, fromLang, toLang, llmConfig) {
 async function translateSmart(text, translateFn, depth = 0) {
   if (!text || !text.trim()) return text;
   if (!hasZh(text)) return text;
+
+  // Pre-split for engines with hard length limits (Bing = 1000 chars)
+  if (text.length > 900 && depth <= 5) {
+    const mid = Math.floor(text.length / 2);
+    let splitAt = text.lastIndexOf('\n', mid);
+    if (splitAt < text.length * 0.2) splitAt = mid;
+
+    const t1 = await translateSmart(text.substring(0, splitAt), translateFn, depth + 1);
+    await delay(800);
+    const t2 = await translateSmart(text.substring(splitAt), translateFn, depth + 1);
+    return t1 + t2;
+  }
 
   let lastErr;
   for (let i = 0; i < 3; i++) {
@@ -643,7 +681,7 @@ async function translateContentLinewise(content, translateFn, logger, concurrenc
 
 // ── HTML-aware replaceString translation ─────────────────────
 
-async function translateScriptStrings(scriptBlock, translateFn, glossaryMap) {
+async function translateScriptStrings(scriptBlock, translateFn, glossaryMap, logger) {
   // Extract content between <script...> and </script>
   const openMatch = scriptBlock.match(/^(<script[^>]*>)/i);
   const closeTag = '</script>';
@@ -665,19 +703,25 @@ async function translateScriptStrings(scriptBlock, translateFn, glossaryMap) {
   }
 
   if (replacements.length === 0) return scriptBlock;
+  if (logger) logger(`script: ${replacements.length} Chinese strings found`);
 
   // Translate in reverse order to preserve indices
   let result = inner;
+  let translated = 0;
   for (let i = replacements.length - 1; i >= 0; i--) {
     const r = replacements[i];
     try {
-      const translated = await translateSmart(r.content, translateFn);
-      if (translated !== r.content) {
-        result = result.substring(0, r.start) + r.quote + translated + r.quote + result.substring(r.end);
+      const tr = await translateSmart(r.content, translateFn);
+      if (tr !== r.content) {
+        result = result.substring(0, r.start) + r.quote + tr + r.quote + result.substring(r.end);
+        translated++;
       }
-    } catch (e) { /* keep original on error */ }
+    } catch (e) {
+      if (logger) logger(`script string ${i} error: ${e.message.substring(0, 80)}`);
+    }
   }
 
+  if (logger) logger(`script: ${translated}/${replacements.length} strings translated`);
   return openTag + result + closeTag;
 }
 
@@ -706,13 +750,15 @@ async function translateHtmlReplaceString(content, translateFn, chunkSize, logge
   if (lastIdx < text.length) segments.push({ type: 'html', content: text.slice(lastIdx) });
 
   // Process each segment
+  if (logger) logger(`${segments.length} segments (${segments.filter(s => s.type === 'html').length} html, ${segments.filter(s => s.type === 'script').length} script, ${segments.filter(s => s.type === 'style').length} style)`);
+
   for (let i = 0; i < segments.length; i++) {
     const s = segments[i];
 
     if (s.type === 'style') continue; // CSS — skip
 
     if (s.type === 'script') {
-      segments[i].content = await translateScriptStrings(s.content, translateFn, glossaryMap);
+      segments[i].content = await translateScriptStrings(s.content, translateFn, glossaryMap, logger);
       continue;
     }
 
@@ -727,17 +773,31 @@ async function translateHtmlReplaceString(content, translateFn, chunkSize, logge
       while ((am = attrRe.exec(html)) !== null) {
         if (hasZh(am[2])) attrMatches.push({ start: am.index + am[1].length, end: am.index + am[1].length + am[2].length, value: am[2] });
       }
+      if (attrMatches.length > 0 && logger) logger(`seg ${i}: ${attrMatches.length} Chinese attributes`);
       for (let j = attrMatches.length - 1; j >= 0; j--) {
         const a = attrMatches[j];
         try {
           const translated = await translateSmart(a.value, translateFn);
           if (translated !== a.value) html = html.substring(0, a.start) + translated + html.substring(a.end);
-        } catch (e) { /* keep original */ }
+        } catch (e) {
+          if (logger) logger(`attr ${j} error: ${e.message.substring(0, 80)}`);
+        }
       }
 
-      // Translate text content between tags via existing translateContent
+      // Translate text content between tags via translateContent, with linewise fallback
       const result = await translateContent(html, translateFn, chunkSize, logger, glossaryMap, concurrency);
-      if (result.ok) segments[i].content = result.content;
+      if (result.ok) {
+        segments[i].content = result.content;
+      } else {
+        if (logger) logger(`seg ${i}: chunk failed (${result.reason}), trying linewise`);
+        const lw = await translateContentLinewise(html, translateFn, logger, concurrency, glossaryMap);
+        if (lw.ok) {
+          segments[i].content = lw.content;
+          if (logger) logger(`seg ${i}: linewise OK (${lw.linesFixed} lines)`);
+        } else {
+          if (logger) logger(`seg ${i}: linewise also failed (${lw.reason})`);
+        }
+      }
     }
   }
 
@@ -1478,11 +1538,16 @@ async function main() {
     return null;
   }
 
+  // Build card glossary with regex marker pool (used for both card items and regex scripts)
+  let cardGlossary = glossary;
+  if (isCharCard) {
+    const markerPool = buildRegexMarkerPool(data.data || data);
+    cardGlossary = mergeMarkerPool(glossary, markerPool);
+    if (markerPool.size > 0) logger.log(`Regex marker pool: ${markerPool.size} terms protected`);
+  }
+
   if (isCharCard) {
     // ── Character card translation loop ──
-    const markerPool = buildRegexMarkerPool(data.data || data);
-    const cardGlossary = mergeMarkerPool(glossary, markerPool);
-    if (markerPool.size > 0) logger.log(`Regex marker pool: ${markerPool.size} terms protected`);
 
     const items = getCharCardItems(data);
     state.total = items.length;
@@ -1603,7 +1668,7 @@ async function main() {
   if (getRegexScriptArrays(data).some(a => a.length > 0)) {
     regexStats = await translateRegexScripts(
       data, translateFn, fallbackFn, chunkSize, fallbackChunkSize,
-      glossary, concurrency, outputPath, logger
+      cardGlossary, concurrency, outputPath, logger
     );
   }
 
