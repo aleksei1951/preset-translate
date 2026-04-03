@@ -1310,13 +1310,56 @@ function buildRegexMarkerPool(data) {
   return pool;
 }
 
-function mergeMarkerPool(baseGlossary, markerPool) {
-  if (markerPool.size === 0) return baseGlossary;
+function mergeMarkerPool(baseGlossary, translationMap) {
+  if (!translationMap || Object.keys(translationMap).length === 0) return baseGlossary;
   const merged = { ...baseGlossary };
-  for (const term of markerPool) {
-    if (!(term in merged)) merged[term] = term;
+  for (const [term, translation] of Object.entries(translationMap)) {
+    if (!(term in merged)) merged[term] = translation;
   }
   return merged;
+}
+
+async function translateMarkerPool(pool, translateFn, userGlossary) {
+  const map = {};
+  for (const term of pool) {
+    // User glossary takes precedence (if it has a non-identity mapping)
+    if (userGlossary && term in userGlossary && userGlossary[term] !== term) {
+      map[term] = userGlossary[term];
+      continue;
+    }
+    try {
+      const tr = await translateSmart(term, translateFn);
+      map[term] = (tr && tr.trim() && tr !== term) ? tr.trim() : term;
+    } catch (e) {
+      map[term] = term; // fallback: identity-map
+    }
+    await delay(400);
+  }
+  return map;
+}
+
+function rewriteFindRegex(data, translationMap) {
+  const sortedTerms = Object.keys(translationMap)
+    .filter(k => translationMap[k] !== k)
+    .sort((a, b) => b.length - a.length);
+  if (sortedTerms.length === 0) return 0;
+
+  let rewritten = 0;
+  for (const scripts of getRegexScriptArrays(data)) {
+    for (const s of scripts) {
+      if (!s.findRegex) continue;
+      let regex = s.findRegex;
+      let changed = false;
+      for (const zh of sortedTerms) {
+        if (!regex.includes(zh)) continue;
+        const escaped = translationMap[zh].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        regex = regex.split(zh).join(escaped);
+        changed = true;
+      }
+      if (changed) { s.findRegex = regex; rewritten++; }
+    }
+  }
+  return rewritten;
 }
 
 async function translateRegexScripts(data, translateFn, fallbackFn, chunkSize, fallbackChunkSize, glossary, concurrency, outputPath, logger) {
@@ -1324,8 +1367,7 @@ async function translateRegexScripts(data, translateFn, fallbackFn, chunkSize, f
   const allScripts = scriptArrays.flat();
   if (allScripts.length === 0) return { translated: 0, skipped: 0, failed: 0 };
 
-  const markerPool = buildRegexMarkerPool(data);
-  const safeGlossary = mergeMarkerPool(glossary, markerPool);
+  const safeGlossary = glossary; // already includes translated marker pool terms
 
   let translated = 0, skipped = 0, failed = 0;
 
@@ -1538,12 +1580,21 @@ async function main() {
     return null;
   }
 
-  // Build card glossary with regex marker pool (used for both card items and regex scripts)
+  // Build card glossary: translate regex keywords and sync findRegex
   let cardGlossary = glossary;
+  let regexTranslationMap = {};
   if (isCharCard) {
     const markerPool = buildRegexMarkerPool(data.data || data);
-    cardGlossary = mergeMarkerPool(glossary, markerPool);
-    if (markerPool.size > 0) logger.log(`Regex marker pool: ${markerPool.size} terms protected`);
+    if (markerPool.size > 0) {
+      logger.log(`Translating ${markerPool.size} regex keywords...`);
+      regexTranslationMap = await translateMarkerPool(markerPool, translateFn, glossary);
+      const trCount = Object.entries(regexTranslationMap).filter(([k, v]) => k !== v).length;
+      logger.log(`Regex keywords: ${trCount}/${markerPool.size} translated`);
+      for (const [zh, tr] of Object.entries(regexTranslationMap)) {
+        if (zh !== tr) logger.log(`  ${zh} → ${tr}`);
+      }
+    }
+    cardGlossary = mergeMarkerPool(glossary, regexTranslationMap);
   }
 
   if (isCharCard) {
@@ -1663,6 +1714,15 @@ async function main() {
   state.running = false;
   clearInterval(renderInterval);
   logUpdate.clear();
+
+  // Rewrite findRegex patterns with translated keywords before translating replaceStrings
+  if (isCharCard && Object.keys(regexTranslationMap).length > 0) {
+    const rwCount = rewriteFindRegex(data.data || data, regexTranslationMap);
+    if (rwCount > 0) {
+      logger.log(`Rewrote findRegex in ${rwCount} scripts`);
+      fs.writeFileSync(outputPath, JSON.stringify(data, null, 4));
+    }
+  }
 
   let regexStats = { translated: 0, skipped: 0, failed: 0 };
   if (getRegexScriptArrays(data).some(a => a.length > 0)) {
